@@ -1,5 +1,4 @@
 pytube
-youtube_transcript_api
 chardet
 numpy==1.22.0
 streamlit
