@@ -297,29 +297,34 @@ def main():
                 else:
                     st.error("Please enter at least one YouTube URL")
 
+
     # Features Container
     if st.session_state.analyzer.combined_text:
         with st.expander("💡 Analysis Features", expanded=True):
             col1, col2, col3 = st.columns(3)
+            
             with col1:
                 if st.button("📝 Generate Summary", use_container_width=True):
                     with st.spinner("Generating summary..."):
                         summary = st.session_state.analyzer.generate_summary(model_name)
-                        with st.container(border=True):
-                            st.markdown(summary)
+            
             with col2:
                 if st.button("⏳ Create Timeline", use_container_width=True):
                     with st.spinner("Creating timeline..."):
                         timeline = st.session_state.analyzer.generate_timeline(model_name)
-                        with st.container(border=True):
-                            st.markdown(timeline)
+            
             with col3:
                 if st.button("🔑 Extract Key Terms", use_container_width=True):
                     with st.spinner("Identifying key terms..."):
                         llm = ChatGroq(temperature=0.3, model_name=model_name, api_key=GROQ_API_KEY)
                         terms = llm.invoke(f"Extract 15-20 key terms from this content: {st.session_state.analyzer.combined_text[:10000]}").content
-                        with st.container(border=True):
-                            st.markdown(terms)
+            
+            if 'summary' in locals():
+                st.markdown(summary)
+            if 'timeline' in locals():
+                st.markdown(timeline)
+            if 'terms' in locals():
+                st.markdown(terms)
 
         # Question Answering Section
         st.markdown("---")
