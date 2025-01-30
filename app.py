@@ -70,39 +70,138 @@ class VideoProcessor:
             return url.split("youtu.be/")[1].split("?")[0]
         return url.split("v=")[1].split("&")[0]
 
-    def get_transcript(self, url):
+    def get_available_languages(self, video_id):
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            languages = []
+            
+            # Get manual transcripts
+            for transcript in transcript_list._manually_created_transcripts.values():
+                languages.append({
+                    'code': transcript.language_code,
+                    'name': transcript.language,
+                    'type': 'Manual'
+                })
+            
+            # Get auto-generated transcripts
+            for transcript in transcript_list._generated_transcripts.values():
+                languages.append({
+                    'code': transcript.language_code,
+                    'name': transcript.language,
+                    'type': 'Auto-generated'
+                })
+            
+            return languages
+        except Exception as e:
+            return []
+
+    def get_transcript(self, url, target_language='en'):
         try:
             video_id = self.get_video_id(url)
-            transcript = YouTubeTranscriptApi.get_transcript(video_id)
-            return " ".join([t['text'] for t in transcript])
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            
+            try:
+                # First try to get transcript in target language
+                transcript = transcript_list.find_transcript([target_language])
+            except:
+                # If target language not available, try auto-generated transcript
+                try:
+                    transcript = transcript_list.find_generated_transcript([target_language])
+                except:
+                    # If no auto-generated transcript in target language, try manual transcript and translate
+                    try:
+                        transcript = transcript_list.find_manually_created_transcript()
+                    except:
+                        # Get any available transcript and translate
+                        available_transcripts = (
+                            list(transcript_list._manually_created_transcripts.values()) +
+                            list(transcript_list._generated_transcripts.values())
+                        )
+                        if not available_transcripts:
+                            raise Exception("No transcripts available")
+                        transcript = available_transcripts[0]
+                
+                if target_language != transcript.language_code:
+                    transcript = transcript.translate(target_language)
+            
+            # Get transcript text
+            transcript_text = " ".join([t['text'] for t in transcript.fetch()])
+            
+            # Try to get video title, but don't fail if we can't
+            try:
+                yt = YouTube(url)
+                title = yt.title
+            except:
+                title = f"Video ({video_id})"
+            
+            return transcript_text, title
+            
         except Exception as e:
-            st.error(f"Error fetching transcript: {str(e)}")
-            return None
+            available_langs = self.get_available_languages(video_id)
+            if available_langs:
+                lang_info = "\nAvailable languages:\n" + "\n".join([
+                    f"- {lang['name']} ({lang['code']}) [{lang['type']}]"
+                    for lang in available_langs
+                ])
+            else:
+                lang_info = "\nNo transcripts available for this video."
+                
+            st.error(f"Error fetching transcript: {str(e)}{lang_info}")
+            return None, None
 
 class ContentAnalyzer:
     def __init__(self):
-        self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        try:
+            self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        except Exception as e:
+            st.error(f"Error initializing embeddings: {str(e)}")
+            self.embeddings = None
         self.vector_store = None
         self.combined_text = ""
+        self.video_titles = []
 
-    def process_videos(self, urls):
+    def process_videos(self, urls, language='en'):
+        if not self.embeddings:
+            st.error("Embeddings not initialized. Cannot process videos.")
+            return None
+
         processor = VideoProcessor()
         all_text = []
+        self.video_titles = []
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         for i, url in enumerate(urls):
             status_text.markdown(f"📹 Processing video {i+1}/{len(urls)}...")
-            text = processor.get_transcript(url)
+            text, title = processor.get_transcript(url, target_language=language)
             if text:
                 all_text.append(text)
+                self.video_titles.append(title or f"Video {i+1}")
             progress_bar.progress((i+1)/len(urls))
         
+        if not all_text:
+            st.error("No valid transcripts found from the provided URLs.")
+            return None
+
         self.combined_text = "\n\n".join(all_text)
         chunks = processor.text_splitter.split_text(self.combined_text)
-        self.vector_store = FAISS.from_texts(chunks, self.embeddings)
-        return self.vector_store
+        
+        if not chunks:
+            st.error("No text chunks generated from the transcripts.")
+            return None
+
+        try:
+            metadatas = []
+            for i, _ in enumerate(chunks):
+                video_index = i % len(self.video_titles)
+                metadatas.append({"source": self.video_titles[video_index]})
+            
+            self.vector_store = FAISS.from_texts(chunks, self.embeddings, metadatas=metadatas)
+            return self.vector_store
+        except Exception as e:
+            st.error(f"Error creating vector store: {str(e)}")
+            return None
 
     def query_content(self, question, model_name="mixtral-8x7b-32768"):
         if not self.vector_store:
@@ -153,10 +252,31 @@ def main():
             ["mixtral-8x7b-32768", "llama2-70b-4096"],
             help="Select Groq model for processing"
         )
+        
+        language = st.selectbox(
+            "Transcript Language",
+            ["en", "te", "hi", "ta", "ml", "kn", "es", "fr", "de", "ja", "ko", "zh-Hans"],
+            format_func=lambda x: {
+                'en': 'English',
+                'te': 'Telugu',
+                'hi': 'Hindi',
+                'ta': 'Tamil',
+                'ml': 'Malayalam',
+                'kn': 'Kannada',
+                'es': 'Spanish',
+                'fr': 'French',
+                'de': 'German',
+                'ja': 'Japanese',
+                'ko': 'Korean',
+                'zh-Hans': 'Chinese (Simplified)'
+            }[x],
+            help="Select the language for video transcripts. If not available, will be translated to this language."
+        )
+        
         st.markdown("---")
         st.markdown("**How to use:**\n1. Paste YouTube URLs\n2. Process videos\n3. Ask questions or generate insights")
         st.markdown("---")
-        st.markdown("Made with ❤️ by [Your Name]")
+        st.markdown("Made with ❤️ by Fyzan Ahammad")
 
     # Main Content Area
     with st.container():
@@ -164,7 +284,7 @@ def main():
         with col1:
             urls = st.text_area(
                 "📥 Enter YouTube URLs (one per line)",
-                height=150,
+                height=100,
                 placeholder="Paste YouTube links here..."
             )
         with col2:
@@ -172,7 +292,7 @@ def main():
             if st.button("🚀 Process Videos", use_container_width=True):
                 if urls.strip():
                     url_list = [url.strip() for url in urls.split('\n') if url.strip()]
-                    st.session_state.analyzer.process_videos(url_list)
+                    st.session_state.analyzer.process_videos(url_list, language)
                     st.success("✅ Videos processed successfully!")
                 else:
                     st.error("Please enter at least one YouTube URL")
@@ -220,7 +340,10 @@ def main():
                     with st.expander("📚 View Source Context"):
                         for doc in sources:
                             st.markdown(f"```\n{doc.page_content}\n```")
-                            st.caption(f"Source: Video {doc.metadata['source']}")
+                            if 'source' in doc.metadata:
+                                st.caption(f"Source: {doc.metadata['source']}")
+                            else:
+                                st.caption("Source: Unknown")
 
 if __name__ == "__main__":
     main()
