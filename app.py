@@ -1,116 +1,226 @@
-import streamlit as st
 import os
-import subprocess
+from dotenv import load_dotenv
+import streamlit as st
+from youtube_transcript_api import YouTubeTranscriptApi
 from pytube import YouTube
-import torch
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline, BartTokenizer, BartForConditionalGeneration, BertTokenizer, BertForQuestionAnswering
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from langchain_groq import ChatGroq
+import numpy as np
 
-# Load pre-trained models and tokenizers for summarization and QA
-summarization_model = BartForConditionalGeneration.from_pretrained('facebook/bart-large-cnn')
-summarization_tokenizer = BartTokenizer.from_pretrained('facebook/bart-large-cnn')
+# Load environment variables from .env file
+load_dotenv()
 
-qa_tokenizer = BertTokenizer.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
-qa_model = BertForQuestionAnswering.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
+# Get Groq API key
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
-def rename_audio(file_path):
-    new_file_name = "audio_file"
-    file_directory = os.path.dirname(file_path)
-    file_extension = os.path.splitext(file_path)[1]
-    count = 1
-    while os.path.exists(os.path.join(file_directory, f"{new_file_name}_{count}{file_extension}")):
-        count += 1
-    new_file_name = f"{new_file_name}_{count}{file_extension}"
-    new_file_path = os.path.join(file_directory, new_file_name)
-    os.rename(file_path, new_file_path)
-    return new_file_path
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY not found in environment variables. Please check your .env file.")
 
-def convert_to_wav(file_path, status_text):
-    status_text.text("Converting audio to WAV format...")
-    output_directory = os.path.dirname(file_path)
-    wav_file_name = os.path.splitext(os.path.basename(file_path))[0] + ".wav"
-    wav_file_path = os.path.join(output_directory, wav_file_name)
-    subprocess.run(["ffmpeg", "-i", file_path, "-acodec", "pcm_s16le", "-ar", "44100", wav_file_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return wav_file_path
+# Custom CSS for enhanced UI
+st.markdown("""
+<style>
+    .main {
+        background-color: #f8f9fa;
+    }
+    .stTextInput input, .stTextArea textarea {
+        border-radius: 20px;
+        padding: 10px 15px;
+    }
+    .stButton button {
+        border-radius: 20px;
+        background: linear-gradient(145deg, #6c5ce7, #a363d9);
+        color: white;
+        font-weight: 600;
+        border: none;
+        transition: all 0.3s;
+    }
+    .stButton button:hover {
+        transform: scale(1.05);
+        box-shadow: 0 4px 15px rgba(108,92,231,0.4);
+    }
+    .feature-card {
+        background: white;
+        border-radius: 15px;
+        padding: 20px;
+        margin: 10px 0;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    .response-area {
+        background: #ffffff;
+        border-radius: 15px;
+        padding: 20px;
+        margin-top: 15px;
+        border: 1px solid #e0e0e0;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-def download_audio(youtube_url, progress_bar, status_text):
-    status_text.text("Downloading audio from YouTube...")
-    yt = YouTube(youtube_url)
-    output_path = "downloaded_audio"
-    audio_stream = yt.streams.get_audio_only()
-    downloaded_file_path = audio_stream.download(output_path)
-    renamed_file_path = rename_audio(downloaded_file_path)
-    progress_bar.progress(0.2)
-    return convert_to_wav(renamed_file_path, status_text)
+class VideoProcessor:
+    def __init__(self):
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1500,
+            chunk_overlap=300
+        )
 
-def transcribe_audio(wav_file_path, progress_bar, status_text):
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    model_id = "openai/whisper-tiny"
+    def get_video_id(self, url):
+        if "youtu.be/" in url:
+            return url.split("youtu.be/")[1].split("?")[0]
+        return url.split("v=")[1].split("&")[0]
 
-    status_text.text("Loading transcription model...")
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True)
-    model.to(device)
-    processor = AutoProcessor.from_pretrained(model_id)
-
-    pipe = pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        max_new_tokens=128,
-        chunk_length_s=30,
-        batch_size=16,
-        return_timestamps=False,
-        torch_dtype=torch_dtype,
-        device=device,
-    )
-
-    status_text.text("Transcribing audio...")
-    result = pipe(wav_file_path)
-    progress_bar.progress(0.6)
-    return result["text"]
-
-def generate_summary(transcription_text):
-    inputs = summarization_tokenizer.encode("summarize: " + transcription_text, return_tensors="pt", max_length=1024, truncation=True)
-    summary_ids = summarization_model.generate(inputs, max_length=150, min_length=40, length_penalty=2.0, num_beams=4, early_stopping=True)
-    summary = summarization_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-    return summary
-
-def answer_question(transcription_text, question):
-    inputs = qa_tokenizer(question, transcription_text, add_special_tokens=True, return_tensors="pt")
-    answer_start_scores, answer_end_scores = qa_model(**inputs, return_dict=False)
-    answer_start = torch.argmax(answer_start_scores)
-    answer_end = torch.argmax(answer_end_scores) + 1
-    answer = qa_tokenizer.convert_tokens_to_string(qa_tokenizer.convert_ids_to_tokens(inputs["input_ids"][0][answer_start:answer_end]))
-    return answer
-
-def main():
-    st.title("YouTube Transcription and QA App")
-
-    youtube_url = st.text_input("Enter a YouTube video URL")
-
-    if youtube_url:
+    def get_transcript(self, url):
         try:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            wav_file_path = download_audio(youtube_url, progress_bar, status_text)
-            transcription_text = transcribe_audio(wav_file_path, progress_bar, status_text)
-            summary = generate_summary(transcription_text)
-
-            st.subheader("Summary")
-            st.write(summary)
-
-            st.subheader("Transcription")
-            st.write(transcription_text)
-
-            st.subheader("Ask a Question")
-            question = st.text_input("Enter your question")
-            if question:
-                answer = answer_question(transcription_text, question)
-                st.write(f"Answer: {answer}")
-                
+            video_id = self.get_video_id(url)
+            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            return " ".join([t['text'] for t in transcript])
         except Exception as e:
-            st.error(f"An error occurred: {e}")
+            st.error(f"Error fetching transcript: {str(e)}")
+            return None
+
+class ContentAnalyzer:
+    def __init__(self):
+        self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        self.vector_store = None
+        self.combined_text = ""
+
+    def process_videos(self, urls):
+        processor = VideoProcessor()
+        all_text = []
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for i, url in enumerate(urls):
+            status_text.markdown(f"📹 Processing video {i+1}/{len(urls)}...")
+            text = processor.get_transcript(url)
+            if text:
+                all_text.append(text)
+            progress_bar.progress((i+1)/len(urls))
+        
+        self.combined_text = "\n\n".join(all_text)
+        chunks = processor.text_splitter.split_text(self.combined_text)
+        self.vector_store = FAISS.from_texts(chunks, self.embeddings)
+        return self.vector_store
+
+    def query_content(self, question, model_name="mixtral-8x7b-32768"):
+        if not self.vector_store:
+            return "Please process videos first!"
+        
+        retriever = self.vector_store.as_retriever(search_kwargs={'k': 4})
+        llm = ChatGroq(temperature=0.5, model_name=model_name, api_key=GROQ_API_KEY)
+        qa_chain = RetrievalQA.from_chain_type(
+            llm,
+            retriever=retriever,
+            return_source_documents=True
+        )
+        result = qa_chain.invoke({"query": question})
+        return result['result'], result['source_documents']
+
+    def generate_summary(self, model_name="mixtral-8x7b-32768"):
+        llm = ChatGroq(temperature=0.2, model_name=model_name, api_key=GROQ_API_KEY)
+        prompt = f"""
+        Generate a comprehensive summary of the following content from multiple YouTube videos.
+        Use markdown formatting with sections and bullet points.
+        Content: {self.combined_text[:10000]}
+        """
+        return llm.invoke(prompt).content
+
+    def generate_timeline(self, model_name="mixtral-8x7b-32768"):
+        llm = ChatGroq(temperature=0.3, model_name=model_name, api_key=GROQ_API_KEY)
+        prompt = f"""
+        Create a chronological timeline of key events from this content:
+        {self.combined_text[:10000]}
+        Format as markdown with timestamps and brief descriptions.
+        """
+        return llm.invoke(prompt).content
+
+# Streamlit App Layout
+def main():
+    st.title("🎬 VideoMind Analyzer")
+    st.markdown("### AI-Powered YouTube Video Analysis Suite")
+
+    # Initialize session state
+    if 'analyzer' not in st.session_state:
+        st.session_state.analyzer = ContentAnalyzer()
+
+    # Sidebar for Settings
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        model_name = st.selectbox(
+            "Choose AI Model",
+            ["mixtral-8x7b-32768", "llama2-70b-4096"],
+            help="Select Groq model for processing"
+        )
+        st.markdown("---")
+        st.markdown("**How to use:**\n1. Paste YouTube URLs\n2. Process videos\n3. Ask questions or generate insights")
+        st.markdown("---")
+        st.markdown("Made with ❤️ by [Your Name]")
+
+    # Main Content Area
+    with st.container():
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            urls = st.text_area(
+                "📥 Enter YouTube URLs (one per line)",
+                height=150,
+                placeholder="Paste YouTube links here..."
+            )
+        with col2:
+            st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+            if st.button("🚀 Process Videos", use_container_width=True):
+                if urls.strip():
+                    url_list = [url.strip() for url in urls.split('\n') if url.strip()]
+                    st.session_state.analyzer.process_videos(url_list)
+                    st.success("✅ Videos processed successfully!")
+                else:
+                    st.error("Please enter at least one YouTube URL")
+
+    # Features Container
+    if st.session_state.analyzer.combined_text:
+        with st.expander("💡 Analysis Features", expanded=True):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                if st.button("📝 Generate Summary", use_container_width=True):
+                    with st.spinner("Generating summary..."):
+                        summary = st.session_state.analyzer.generate_summary(model_name)
+                        with st.container(border=True):
+                            st.markdown(summary)
+            with col2:
+                if st.button("⏳ Create Timeline", use_container_width=True):
+                    with st.spinner("Creating timeline..."):
+                        timeline = st.session_state.analyzer.generate_timeline(model_name)
+                        with st.container(border=True):
+                            st.markdown(timeline)
+            with col3:
+                if st.button("🔑 Extract Key Terms", use_container_width=True):
+                    with st.spinner("Identifying key terms..."):
+                        llm = ChatGroq(temperature=0.3, model_name=model_name, api_key=GROQ_API_KEY)
+                        terms = llm.invoke(f"Extract 15-20 key terms from this content: {st.session_state.analyzer.combined_text[:10000]}").content
+                        with st.container(border=True):
+                            st.markdown(terms)
+
+        # Question Answering Section
+        st.markdown("---")
+        question = st.text_input(
+            "💬 Ask anything about the video content:",
+            placeholder="Type your question here..."
+        )
+        
+        if question:
+            with st.spinner("🔍 Analyzing content..."):
+                answer, sources = st.session_state.analyzer.query_content(question, model_name)
+                
+                # Display Answer
+                with st.container(border=True):
+                    st.markdown(f"**Answer:**\n{answer}")
+                    
+                    # Display Sources
+                    with st.expander("📚 View Source Context"):
+                        for doc in sources:
+                            st.markdown(f"```\n{doc.page_content}\n```")
+                            st.caption(f"Source: Video {doc.metadata['source']}")
 
 if __name__ == "__main__":
     main()

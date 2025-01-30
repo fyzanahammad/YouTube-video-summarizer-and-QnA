@@ -1,4 +1,13 @@
-pytube
-chardet
-numpy==1.22.0
 streamlit
+youtube-transcript-api
+pytube
+openai
+langchain
+faiss-cpu
+tiktoken
+chardet
+numpy
+python-dotenv
+langchain-community
+langchain-groq
+sentence-transformers
